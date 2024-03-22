@@ -36,7 +36,7 @@ internal class OpenFileDialogAdapter : IOpenFileDialog
         {
             options.FileTypeFilter = new[]
             {
-                new FilePickerFileType(Filter.Header) { Patterns = Filter.Extensions.AsReadOnly() }
+                new FilePickerFileType(Filter.Header) { Patterns = Filter.Extensions.Select(e=>$"*.{e}").ToList().AsReadOnly() }
             };
         }
 
