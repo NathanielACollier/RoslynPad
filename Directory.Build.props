@@ -51,4 +51,8 @@
     <None Include="README.md" Pack="true" PackagePath="\"
           Condition=" Exists('$(MSBuildProjectDirectory)\README.md') " />
   </ItemGroup>
+  <PropertyGroup>
+  <NuGetAudit>false</NuGetAudit>
+</PropertyGroup>
+
 </Project>
