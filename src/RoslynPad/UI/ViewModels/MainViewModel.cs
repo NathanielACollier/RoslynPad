@@ -6,9 +6,11 @@ using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
+using Avalonia;
+using Avalonia.Styling;
 using Microsoft.CodeAnalysis;
 using Microsoft.Extensions.DependencyInjection;
-using NuGet.Packaging;
+using System.Composition;
 using RoslynPad.Build;
 using RoslynPad.Roslyn;
 using RoslynPad.Themes;
@@ -16,7 +18,8 @@ using RoslynPad.Utilities;
 
 namespace RoslynPad.UI;
 
-public abstract class MainViewModel : NotificationObject, IDisposable
+[Export(typeof(MainViewModel)), Shared]
+public class MainViewModel : NotificationObject, IDisposable
 {
     private static readonly Version s_currentVersion = Assembly.GetEntryAssembly()?.GetName().Version ?? new Version();
 
@@ -26,6 +29,7 @@ public abstract class MainViewModel : NotificationObject, IDisposable
     private readonly DocumentFileWatcher _documentFileWatcher;
     private readonly string _editorConfigPath;
     private readonly VsCodeThemeReader _themeManager;
+    private readonly HomeViewModel _home = new();
     private double _editorFontSize;
     private DocumentViewModel _documentRoot;
     private DocumentWatcher? _documentWatcher;
@@ -55,6 +59,7 @@ public abstract class MainViewModel : NotificationObject, IDisposable
         }
     }
 
+    [method: ImportingConstructor]
     public MainViewModel(IServiceProvider serviceProvider, IErrorReporter errorReporter, ICommandProvider commands, IApplicationSettings settings, NuGetViewModel nugetViewModel, DocumentFileWatcher documentFileWatcher)
     {
         _serviceProvider = serviceProvider;
@@ -144,8 +149,8 @@ public abstract class MainViewModel : NotificationObject, IDisposable
 
             (string file, ThemeType type) theme = builtInTheme switch
             {
-                BuiltInTheme.Light => ("light_modern.json", ThemeType.Light),
-                BuiltInTheme.Dark => ("dark_modern.json", ThemeType.Dark),
+                BuiltInTheme.Light => ("2026-light.json", ThemeType.Light),
+                BuiltInTheme.Dark => ("2026-dark.json", ThemeType.Dark),
                 _ => throw new ArgumentOutOfRangeException(nameof(builtInTheme)),
             };
 
@@ -178,7 +183,19 @@ public abstract class MainViewModel : NotificationObject, IDisposable
         }
     }
 
-    protected abstract void ListenToSystemThemeChanges(Action onChange);
+    private static void ListenToSystemThemeChanges(Action onChange)
+    {
+        if (Application.Current is { } app)
+        {
+            app.ActualThemeVariantChanged += (_, _) =>
+            {
+                if (app.RequestedThemeVariant is null)
+                {
+                    onChange();
+                }
+            };
+        }
+    }
 
     public async Task Initialize()
     {
@@ -266,7 +283,7 @@ public abstract class MainViewModel : NotificationObject, IDisposable
         return d;
     }
 
-    protected abstract bool IsSystemDarkTheme();
+    private static bool IsSystemDarkTheme() => Application.Current?.ActualThemeVariant == ThemeVariant.Dark;
 
     public string WindowTitle
     {
@@ -408,7 +425,7 @@ public abstract class MainViewModel : NotificationObject, IDisposable
         }
 
         var settings = new SettingsViewModel(Settings);
-        OpenDocuments.Add(settings);
+        AddOpenDocument(settings);
         ActiveContent = settings;
     }
 
@@ -423,7 +440,7 @@ public abstract class MainViewModel : NotificationObject, IDisposable
         }
 
         var secrets = new SecretsViewModel(_commands, _serviceProvider.GetRequiredService<IClipboardService>());
-        OpenDocuments.Add(secrets);
+        AddOpenDocument(secrets);
         ActiveContent = secrets;
     }
 
@@ -435,7 +452,7 @@ public abstract class MainViewModel : NotificationObject, IDisposable
         if (openDocument == null)
         {
             openDocument = GetOpenDocumentViewModel(document);
-            OpenDocuments.Add(openDocument);
+            AddOpenDocument(openDocument);
         }
 
         ActiveContent = openDocument;
@@ -472,8 +489,28 @@ public abstract class MainViewModel : NotificationObject, IDisposable
     {
         var openDocument = GetOpenDocumentViewModel();
         openDocument.SourceCodeKind = kind;
-        OpenDocuments.Add(openDocument);
+        AddOpenDocument(openDocument);
         ActiveContent = openDocument;
+    }
+
+    // The Home tab exists only as the empty state, so it is removed whenever a real
+    // document is opened and restored once the last one closes.
+    private void AddOpenDocument(IDocumentContent content)
+    {
+        OpenDocuments.Remove(_home);
+        OpenDocuments.Add(content);
+    }
+
+    private void RemoveOpenDocument(IDocumentContent content)
+    {
+        OpenDocuments.Remove(content);
+
+        if (!OpenDocuments.Any(d => d is not HomeViewModel))
+        {
+            OpenDocuments.Add(_home);
+            CurrentOpenDocument = null;
+            ActiveContent = _home;
+        }
     }
 
     public async Task CloseDocument(OpenDocumentViewModel? document)
@@ -494,7 +531,7 @@ public abstract class MainViewModel : NotificationObject, IDisposable
             RoslynHost?.CloseDocument(document.DocumentId);
         }
 
-        OpenDocuments.Remove(document);
+        RemoveOpenDocument(document);
         document.Close();
     }
 
@@ -514,7 +551,7 @@ public abstract class MainViewModel : NotificationObject, IDisposable
         }
         else
         {
-            OpenDocuments.Remove(content);
+            RemoveOpenDocument(content);
         }
     }
 
@@ -558,7 +595,7 @@ public abstract class MainViewModel : NotificationObject, IDisposable
 
     public IDelegateCommand ClearErrorCommand { get; }
 
-    public bool HasNoOpenDocuments => IsInitialized && OpenDocuments.Count == 0;
+    public bool HasNoOpenDocuments => IsInitialized && !OpenDocuments.Any(d => d is not HomeViewModel);
 
     public IDelegateCommand ReportProblemCommand { get; }
 
@@ -753,14 +790,9 @@ public abstract class MainViewModel : NotificationObject, IDisposable
 
         foreach (var document in GetAllDocumentsForSearch(DocumentRoot))
         {
-            if (SearchDocumentName(document))
-            {
-                document.IsSearchMatch = true;
-            }
-            else
-            {
-                await SearchInFile(document, regex).ConfigureAwait(false);
-            }
+            // assign on the UI thread - the document tree binds to IsSearchMatch
+            document.IsSearchMatch = SearchDocumentName(document) ||
+                await SearchInFile(document, regex).ConfigureAwait(true);
         }
 
         bool SearchDocumentName(DocumentViewModel document)
@@ -786,7 +818,7 @@ public abstract class MainViewModel : NotificationObject, IDisposable
             }
         }
 
-        async Task SearchInFile(DocumentViewModel document, Regex? regex)
+        async Task<bool> SearchInFile(DocumentViewModel document, Regex? regex)
         {
             // a regex can span many lines so we need to load the entire file;
             // otherwise, search line-by-line
@@ -796,23 +828,21 @@ public abstract class MainViewModel : NotificationObject, IDisposable
                 var documentText = await IOUtilities.ReadAllTextAsync(document.Path).ConfigureAwait(false);
                 try
                 {
-                    document.IsSearchMatch = regex.IsMatch(documentText);
+                    return regex.IsMatch(documentText);
                 }
                 catch (RegexMatchTimeoutException)
                 {
-                    document.IsSearchMatch = false;
+                    return false;
                 }
             }
-            else
+
+            // need IAsyncEnumerable here, but for now just push it to the thread-pool
+            return await Task.Run(() =>
             {
-                // need IAsyncEnumerable here, but for now just push it to the thread-pool
-                await Task.Run(() =>
-                {
-                    var lines = IOUtilities.ReadLines(document.Path);
-                    document.IsSearchMatch = lines.Any(line =>
-                        line.Contains(SearchText, StringComparison.OrdinalIgnoreCase));
-                }).ConfigureAwait(false);
-            }
+                var lines = IOUtilities.ReadLines(document.Path);
+                return lines.Any(line =>
+                    line.Contains(SearchText, StringComparison.OrdinalIgnoreCase));
+            }).ConfigureAwait(false);
         }
     }
 

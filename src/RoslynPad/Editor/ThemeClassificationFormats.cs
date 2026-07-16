@@ -26,8 +26,8 @@ public sealed partial class ThemeClassificationFormats
     public ThemeClassificationFormats(Theme theme)
     {
         _theme = theme;
-        DefaultForeground = theme.TryGetColor("editor.foreground") is { } foreground ? Color.Parse(foreground) : null;
-        Background = theme.TryGetColor("editor.background") is { } background ? Color.Parse(background) : null;
+        DefaultForeground = theme.TryGetColor("editor.foreground") is { } foreground ? ThemeDictionaryBase.ParseThemeColor(foreground) : null;
+        Background = theme.TryGetColor("editor.background") is { } background ? ThemeDictionaryBase.ParseThemeColor(background) : null;
 
         _styles = s_classifiedScopes
             .Select(t => (t.classification, style: GetStyleForScopes(theme, t.scopes)))
@@ -108,7 +108,7 @@ public sealed partial class ThemeClassificationFormats
         {
             if (_theme.TryGetColor(colorId) is { } color)
             {
-                properties[property] = new SolidColorBrush(Color.Parse(color));
+                properties[property] = new SolidColorBrush(ThemeDictionaryBase.ParseThemeColor(color));
             }
         }
     }
@@ -135,23 +135,9 @@ public sealed partial class ThemeClassificationFormats
         {
             if (_theme.TryGetColor(colorId) is { } color)
             {
-                properties[property] = new SolidColorBrush(ParseThemeColor(color));
+                properties[property] = new SolidColorBrush(ThemeDictionaryBase.ParseThemeColor(color));
             }
         }
-    }
-
-    /// <summary>
-    /// Parses a VS Code theme color, which uses CSS #RRGGBBAA ordering for 8-digit hex values
-    /// (Avalonia's <see cref="Color.Parse"/> would read those as #AARRGGBB).
-    /// </summary>
-    private static Color ParseThemeColor(string color)
-    {
-        if (color.Length == 9 && color[0] == '#' && uint.TryParse(color.AsSpan(1), System.Globalization.NumberStyles.HexNumber, null, out var rgba))
-        {
-            return Color.FromUInt32(((rgba & 0xFF) << 24) | (rgba >> 8));
-        }
-
-        return Color.Parse(color);
     }
 
     /// <summary>
@@ -163,7 +149,7 @@ public sealed partial class ThemeClassificationFormats
     public void ApplyCaret(IEditorFormatMap formatMap)
     {
         var color = _theme.TryGetColor("editorCursor.foreground") is { } cursor
-            ? Color.Parse(cursor)
+            ? ThemeDictionaryBase.ParseThemeColor(cursor)
             : _theme.Type == ThemeType.Light ? Colors.Black : Color.FromRgb(0xAE, 0xAF, 0xAD);
 
         var properties = new Avalonia.Controls.ResourceDictionary
@@ -191,12 +177,12 @@ public sealed partial class ThemeClassificationFormats
         var properties = new Avalonia.Controls.ResourceDictionary();
         if (background is not null)
         {
-            properties[MarkerFormatDefinition.FillId] = new SolidColorBrush(Color.Parse(background));
+            properties[MarkerFormatDefinition.FillId] = new SolidColorBrush(ThemeDictionaryBase.ParseThemeColor(background));
         }
 
         if (border is not null)
         {
-            properties[MarkerFormatDefinition.BorderId] = new Pen(new SolidColorBrush(Color.Parse(border)));
+            properties[MarkerFormatDefinition.BorderId] = new Pen(new SolidColorBrush(ThemeDictionaryBase.ParseThemeColor(border)));
         }
 
         formatMap.SetProperties(Microsoft.CodeAnalysis.BraceMatching.ClassificationTypeDefinitions.BraceMatchingName, properties);
@@ -215,15 +201,17 @@ public sealed partial class ThemeClassificationFormats
             scopes[scope.Key] = scope.Value;
         }
 
-        var classificationsMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        // Multiple classifications can share a token name (e.g. identifier and local name are both
+        // "variable"), so map each classification independently; the custom map wins on conflicts.
+        var tokensMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var classification in SemanticTokensSchema.ClassificationTypeNameToTokenName.Concat(SemanticTokensSchema.ClassificationTypeNameToCustomTokenName))
         {
-            classificationsMap[classification.Value] = classification.Key;
+            tokensMap[classification.Key] = classification.Value;
         }
 
-        return scopes.Select(d => (name: d.Key, found: classificationsMap.TryGetValue(d.Key, out var classification), classification: classification!, scopes: d.Value))
-            .Where(d => d.found)
-            .Select(d => (d.classification, d.scopes))
+        return tokensMap
+            .Where(t => scopes.ContainsKey(t.Value))
+            .Select(t => (classification: t.Key, scopes: scopes[t.Value]))
             .ToImmutableArray();
     }
 
@@ -242,7 +230,7 @@ public sealed partial class ThemeClassificationFormats
     private static ThemeStyle? GetStyleForScopes(Theme theme, string[] scopes) =>
         scopes.Select(theme.TryGetScopeSettings).FirstOrDefault(s => s is not null) is { } scopeSettings
         ? new ThemeStyle(
-            Foreground: scopeSettings.Value.Foreground is { } foreground ? Color.Parse(foreground) : null,
+            Foreground: scopeSettings.Value.Foreground is { } foreground ? ThemeDictionaryBase.ParseThemeColor(foreground) : null,
             Bold: scopeSettings.Value.FontStyle?.Contains("bold", StringComparison.OrdinalIgnoreCase) == true,
             Italic: scopeSettings.Value.FontStyle?.Contains("italic", StringComparison.OrdinalIgnoreCase) == true)
         : null;
