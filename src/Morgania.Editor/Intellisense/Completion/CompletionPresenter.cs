@@ -15,7 +15,6 @@ using Avalonia.Threading;
 
 using Microsoft.VisualStudio.Language.Intellisense.AsyncCompletion;
 using Microsoft.VisualStudio.Language.Intellisense.AsyncCompletion.Data;
-using Microsoft.VisualStudio.Text;
 using Microsoft.VisualStudio.Text.Adornments;
 using Microsoft.VisualStudio.Text.Classification;
 using Microsoft.VisualStudio.Text.Editor;
@@ -451,7 +450,7 @@ internal sealed class CompletionPresenter : ICompletionPresenter
         catch (Exception ex)
         {
             // A failing description never takes the list down; the pane just stays hidden.
-            Console.Error.WriteLine($"completion description failed: {ex}");
+            System.Diagnostics.Debug.WriteLine($"completion description failed: {ex}");
             Dispatcher.UIThread.Post(() => SetDescription(null));
         }
     }
