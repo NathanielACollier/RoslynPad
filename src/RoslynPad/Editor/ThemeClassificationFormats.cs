@@ -141,6 +141,23 @@ public sealed partial class ThemeClassificationFormats
     }
 
     /// <summary>
+    /// Feeds the theme's progress bar color to the background-work indicator (the indeterminate
+    /// bar shown at the top of the view during async operations like go-to-definition into
+    /// decompiled or Source Link sources).
+    /// </summary>
+    public void ApplyBackgroundWorkIndicator(IEditorFormatMap formatMap)
+    {
+        if (_theme.TryGetColor("progressBar.background") is { } color)
+        {
+            var properties = new Avalonia.Controls.ResourceDictionary
+            {
+                [BackgroundWorkIndicatorFormatNames.Foreground] = new SolidColorBrush(ThemeDictionaryBase.ParseThemeColor(color)),
+            };
+            formatMap.SetProperties(BackgroundWorkIndicatorFormatNames.Name, properties);
+        }
+    }
+
+    /// <summary>
     /// Feeds the theme's cursor color to the caret layer through the editor format map.
     /// The bundled themes don't define <c>editorCursor.foreground</c>, so the fallback mirrors
     /// VS Code's coded defaults: black on light themes, a light gray on dark ones (the
@@ -165,10 +182,31 @@ public sealed partial class ThemeClassificationFormats
     /// BraceHighlightTag names. The static BraceMatchingMarkerFormat export remains the
     /// fallback when the theme defines neither color.
     /// </summary>
-    public void ApplyBraceMatching(IEditorFormatMap formatMap)
+    public void ApplyBraceMatching(IEditorFormatMap formatMap) =>
+        ApplyMarker(formatMap, Microsoft.CodeAnalysis.BraceMatching.ClassificationTypeDefinitions.BraceMatchingName,
+            "editorBracketMatch.background", "editorBracketMatch.border");
+
+    /// <summary>
+    /// Feeds the theme's word-highlight colors to the reference highlight markers
+    /// (TextMarkerAdornmentManager) through the editor format map entries Roslyn's
+    /// NavigableHighlightTags name: read references use editor.wordHighlight*, the definition
+    /// and written references the strong variants (VS Code's write-access colors). The static
+    /// marker format exports in Morgania.CodeAnalysis.Editor remain the fallback.
+    /// </summary>
+    public void ApplyReferenceHighlighting(IEditorFormatMap formatMap)
     {
-        var background = _theme.TryGetColor("editorBracketMatch.background");
-        var border = _theme.TryGetColor("editorBracketMatch.border");
+        ApplyMarker(formatMap, Microsoft.CodeAnalysis.Editor.ReferenceHighlighting.ReferenceHighlightTag.TagId,
+            "editor.wordHighlightBackground", "editor.wordHighlightBorder");
+        ApplyMarker(formatMap, Microsoft.CodeAnalysis.Editor.ReferenceHighlighting.DefinitionHighlightTag.TagId,
+            "editor.wordHighlightStrongBackground", "editor.wordHighlightStrongBorder");
+        ApplyMarker(formatMap, Microsoft.CodeAnalysis.Editor.ReferenceHighlighting.WrittenReferenceHighlightTag.TagId,
+            "editor.wordHighlightStrongBackground", "editor.wordHighlightStrongBorder");
+    }
+
+    private void ApplyMarker(IEditorFormatMap formatMap, string markerName, string backgroundKey, string borderKey)
+    {
+        var background = _theme.TryGetColor(backgroundKey);
+        var border = _theme.TryGetColor(borderKey);
         if (background is null && border is null)
         {
             return;
@@ -185,7 +223,7 @@ public sealed partial class ThemeClassificationFormats
             properties[MarkerFormatDefinition.BorderId] = new Pen(new SolidColorBrush(ThemeDictionaryBase.ParseThemeColor(border)));
         }
 
-        formatMap.SetProperties(Microsoft.CodeAnalysis.BraceMatching.ClassificationTypeDefinitions.BraceMatchingName, properties);
+        formatMap.SetProperties(markerName, properties);
     }
 
     private readonly record struct ThemeStyle(Color? Foreground, bool Bold, bool Italic);

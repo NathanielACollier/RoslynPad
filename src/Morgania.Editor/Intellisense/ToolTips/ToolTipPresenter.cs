@@ -48,6 +48,8 @@ public sealed class ToolTipPresenterFactory : IToolTipPresenterFactory
 /// </summary>
 internal sealed class ToolTipPresenter : IToolTipPresenter, IToolTipPresenter2
 {
+    private const double MaxTipWidth = 600.0;
+
     private readonly ITextView _view;
     private readonly ToolTipParameters _parameters;
     private readonly IViewElementFactoryService _viewElementFactory;
@@ -72,7 +74,7 @@ internal sealed class ToolTipPresenter : IToolTipPresenter, IToolTipPresenter2
             BorderThickness = new Thickness(1.0),
             CornerRadius = new CornerRadius(3.0),
             Padding = new Thickness(8.0, 5.0),
-            MaxWidth = 600.0,
+            MaxWidth = MaxTipWidth,
         };
         _container.SetValue(TextElement.ForegroundProperty, brushes.Foreground);
     }
@@ -91,6 +93,7 @@ internal sealed class ToolTipPresenter : IToolTipPresenter, IToolTipPresenter2
         }
 
         _applicableToSpan = applicableToSpan;
+        _container.MaxWidth = _view.ViewportWidth > 0.0 ? Math.Min(MaxTipWidth, _view.ViewportWidth) : MaxTipWidth;
         _panel.Children.Clear();
         foreach (var item in content)
         {
@@ -109,9 +112,11 @@ internal sealed class ToolTipPresenter : IToolTipPresenter, IToolTipPresenter2
 
             _view.TextBuffer.Changed += OnBufferChanged;
             _view.Closed += OnViewClosed;
+            _view.LostAggregateFocus += OnViewLostAggregateFocus;
             if (_parameters.TrackMouse && _view is IWpfTextView wpfView)
             {
                 wpfView.VisualElement.PointerMoved += OnViewPointerMoved;
+                wpfView.VisualElement.PointerExited += OnViewPointerExited;
             }
         }
         else
@@ -130,9 +135,11 @@ internal sealed class ToolTipPresenter : IToolTipPresenter, IToolTipPresenter2
         _dismissed = true;
         _view.TextBuffer.Changed -= OnBufferChanged;
         _view.Closed -= OnViewClosed;
+        _view.LostAggregateFocus -= OnViewLostAggregateFocus;
         if (_view is IWpfTextView wpfView)
         {
             wpfView.VisualElement.PointerMoved -= OnViewPointerMoved;
+            wpfView.VisualElement.PointerExited -= OnViewPointerExited;
         }
 
         if (_manager is { } manager)
@@ -171,6 +178,8 @@ internal sealed class ToolTipPresenter : IToolTipPresenter, IToolTipPresenter2
 
     private void OnViewClosed(object? sender, EventArgs e) => Dismiss();
 
+    private void OnViewLostAggregateFocus(object? sender, EventArgs e) => Dismiss();
+
     private void OnViewPointerMoved(object? sender, PointerEventArgs e)
     {
         if (_dismissed || _applicableToSpan is null || _parameters.KeepOpen || _container.IsPointerOver)
@@ -199,12 +208,27 @@ internal sealed class ToolTipPresenter : IToolTipPresenter, IToolTipPresenter2
         // The pointer left the applicable span and isn't over the tip: schedule the check
         // once more after this input settles (moving from the text into the tip crosses
         // ground that belongs to neither), then dismiss.
-        Dispatcher.UIThread.Post(() =>
-        {
-            if (!_dismissed && !_container.IsPointerOver && !_parameters.KeepOpen)
-            {
-                Dismiss();
-            }
-        }, DispatcherPriority.Input);
+        DismissOncePointerSettlesOutsideTip();
     }
+
+    /// <summary>
+    /// A fast exit can leave the view without a single move inside it, so tracking tips
+    /// also dismiss when the pointer exits the view — which includes moving onto the tip
+    /// itself (the popup covers the view from the overlay layer), hence the settled check.
+    /// </summary>
+    private void OnViewPointerExited(object? sender, PointerEventArgs e)
+    {
+        if (!_dismissed && !_parameters.KeepOpen)
+        {
+            DismissOncePointerSettlesOutsideTip();
+        }
+    }
+
+    private void DismissOncePointerSettlesOutsideTip() => Dispatcher.UIThread.Post(() =>
+    {
+        if (!_dismissed && !_container.IsPointerOver && !_parameters.KeepOpen)
+        {
+            Dismiss();
+        }
+    }, DispatcherPriority.Input);
 }
