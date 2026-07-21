@@ -55,6 +55,22 @@ public sealed partial class ThemeClassificationFormats
 
             formatMap.DefaultTextProperties = defaultProperties;
 
+            // The theme is authoritative: a classification the theme doesn't color must fall back
+            // to the default foreground (or an ancestor classification the theme does color) the
+            // way VS Code renders an unstyled semantic token — not to the static per-classification
+            // fallback color, which is a single-theme (dark) default that bleeds wrongly onto other
+            // themes (e.g. cyan parameters on a light background). Clearing the explicit properties
+            // lets the format map resolve the color through the base-type chain: "record class
+            // name" still inherits the themed "class name", while "parameter name" resolves through
+            // "identifier" to the default text color.
+            foreach (var type in formatMap.CurrentPriorityOrder)
+            {
+                if (type is not null && !_styles.ContainsKey(type.Classification))
+                {
+                    formatMap.SetExplicitTextProperties(type, TextFormattingRunProperties.CreateTextFormattingRunProperties());
+                }
+            }
+
             foreach (var (classification, style) in _styles)
             {
                 if (registry.GetClassificationType(ClassificationLayer.Semantic, classification) is not { } type)
@@ -158,6 +174,78 @@ public sealed partial class ThemeClassificationFormats
     }
 
     /// <summary>
+    /// Feeds the theme's indent-guide color to the block structure guide lines through the
+    /// editor format map. <c>editorIndentGuide.background1</c> resolves through the color
+    /// registry to <c>editorIndentGuide.background</c> / <c>editorWhitespace.foreground</c>
+    /// for themes that use the older keys.
+    /// </summary>
+    public void ApplyBlockStructure(IEditorFormatMap formatMap)
+    {
+        if (_theme.TryGetColor("editorIndentGuide.background1") is { } color)
+        {
+            var properties = new Avalonia.Controls.ResourceDictionary
+            {
+                [Morgania.CodeAnalysis.Editor.BlockStructureFormatNames.Foreground] =
+                    new SolidColorBrush(ThemeDictionaryBase.ParseThemeColor(color)),
+            };
+            formatMap.SetProperties(Morgania.CodeAnalysis.Editor.BlockStructureFormatNames.Name, properties);
+        }
+    }
+
+    /// <summary>
+    /// Feeds the theme's folding colors to the outlining UI through the editor format map:
+    /// the gutter's folding-control color to the margin chevrons and the fold placeholder
+    /// color to the collapsed-region pill.
+    /// </summary>
+    public void ApplyOutlining(IEditorFormatMap formatMap)
+    {
+        if (_theme.TryGetColor("editorGutter.foldingControlForeground") is { } chevron)
+        {
+            formatMap.SetProperties(
+                Microsoft.VisualStudio.Text.Editor.Implementation.OutliningMarginFormatNames.Name,
+                new Avalonia.Controls.ResourceDictionary
+                {
+                    [Microsoft.VisualStudio.Text.Editor.Implementation.OutliningMarginFormatNames.Foreground] =
+                        new SolidColorBrush(ThemeDictionaryBase.ParseThemeColor(chevron)),
+                });
+        }
+
+        if (_theme.TryGetColor("editor.foldPlaceholderForeground") is { } placeholder)
+        {
+            formatMap.SetProperties(
+                Microsoft.VisualStudio.Text.Editor.Implementation.CollapsedAdornmentFormatNames.Name,
+                new Avalonia.Controls.ResourceDictionary
+                {
+                    [Microsoft.VisualStudio.Text.Editor.Implementation.CollapsedAdornmentFormatNames.Foreground] =
+                        new SolidColorBrush(ThemeDictionaryBase.ParseThemeColor(placeholder)),
+                });
+        }
+    }
+
+    /// <summary>
+    /// Feeds the theme's selection colors to the selection layer through the editor format map
+    /// (<c>editor.selectionBackground</c> for focused views, <c>editor.inactiveSelectionBackground</c>
+    /// otherwise; the registry defaults the inactive color to the active one at half opacity,
+    /// matching VS Code).
+    /// </summary>
+    public void ApplySelection(IEditorFormatMap formatMap)
+    {
+        Set(SelectionFormatNames.Active, "editor.selectionBackground");
+        Set(SelectionFormatNames.Inactive, "editor.inactiveSelectionBackground");
+
+        void Set(string key, string colorId)
+        {
+            if (_theme.TryGetColor(colorId) is { } color)
+            {
+                formatMap.SetProperties(key, new Avalonia.Controls.ResourceDictionary
+                {
+                    [EditorFormatDefinition.BackgroundColorId] = ThemeDictionaryBase.ParseThemeColor(color),
+                });
+            }
+        }
+    }
+
+    /// <summary>
     /// Feeds the theme's cursor color to the caret layer through the editor format map.
     /// The bundled themes don't define <c>editorCursor.foreground</c>, so the fallback mirrors
     /// VS Code's coded defaults: black on light themes, a light gray on dark ones (the
@@ -179,7 +267,7 @@ public sealed partial class ThemeClassificationFormats
     /// <summary>
     /// Feeds the theme's bracket-match colors to the brace highlight markers
     /// (TextMarkerAdornmentManager) through the editor format map entry Roslyn's
-    /// BraceHighlightTag names. The static BraceMatchingMarkerFormat export remains the
+    /// BraceHighlightTag names. Roslyn's recompiled BraceMatchingFormatDefinition remains the
     /// fallback when the theme defines neither color.
     /// </summary>
     public void ApplyBraceMatching(IEditorFormatMap formatMap) =>
@@ -190,8 +278,9 @@ public sealed partial class ThemeClassificationFormats
     /// Feeds the theme's word-highlight colors to the reference highlight markers
     /// (TextMarkerAdornmentManager) through the editor format map entries Roslyn's
     /// NavigableHighlightTags name: read references use editor.wordHighlight*, the definition
-    /// and written references the strong variants (VS Code's write-access colors). The static
-    /// marker format exports in Morgania.CodeAnalysis.Editor remain the fallback.
+    /// and written references the strong variants (VS Code's write-access colors). Roslyn's
+    /// recompiled tag definitions (and the host's read-reference marker format) remain the
+    /// fallback.
     /// </summary>
     public void ApplyReferenceHighlighting(IEditorFormatMap formatMap)
     {
@@ -201,6 +290,75 @@ public sealed partial class ThemeClassificationFormats
             "editor.wordHighlightStrongBackground", "editor.wordHighlightStrongBorder");
         ApplyMarker(formatMap, Microsoft.CodeAnalysis.Editor.ReferenceHighlighting.WrittenReferenceHighlightTag.TagId,
             "editor.wordHighlightStrongBackground", "editor.wordHighlightStrongBorder");
+    }
+
+    /// <summary>
+    /// Colors the inline rename field markers (the identifier and its references while a rename
+    /// session edits them in place) with VS's green rename wash: the VS-light value from
+    /// Roslyn's own definition on light themes, an equivalent dark green on dark themes. VS Code
+    /// has no color for in-buffer rename (its F2 opens an input widget), so this is the one spot
+    /// the VS look wins over theme keys. The conflict/fixup markers keep their theme-neutral
+    /// red/green dashed borders, and the "inline rename field" text color is cleared by
+    /// <see cref="Apply"/> like any unthemed classification.
+    /// </summary>
+    public void ApplyInlineRename(IEditorFormatMap formatMap)
+    {
+        var fill = _theme.Type == ThemeType.Light
+            ? Color.FromRgb(0xD3, 0xF8, 0xD3)
+            : Color.FromRgb(0x2B, 0x4B, 0x2B);
+        formatMap.SetProperties(
+            Microsoft.CodeAnalysis.Editor.Implementation.InlineRename.HighlightTags.RenameFieldBackgroundAndBorderTag.TagId,
+            new Avalonia.Controls.ResourceDictionary { [MarkerFormatDefinition.FillId] = new SolidColorBrush(fill) });
+    }
+
+    /// <summary>
+    /// Feeds the theme's severity colors to the inline diagnostics adornments through the
+    /// classification types Roslyn's InlineDiagnosticsTag reads: the foreground colors the
+    /// message text, the background draws the pill border.
+    /// </summary>
+    public void ApplyInlineDiagnostics(IClassificationFormatMap formatMap, IClassificationTypeRegistryService registry)
+    {
+        Set("inline diagnostics - syntax error", "editorError.foreground", withBackground: true);
+        Set("inline diagnostics - compiler warning", "editorWarning.foreground", withBackground: true);
+        Set("inline diagnostics - Edit and Continue", "editorError.foreground", withBackground: true);
+        // The diagnostic-id hyperlink renders in the "url" classification.
+        Set("url", "textLink.foreground", withBackground: false);
+
+        void Set(string classification, string colorId, bool withBackground)
+        {
+            if (_theme.TryGetColor(colorId) is not { } themeColor ||
+                registry.GetClassificationType(classification) is not { } type)
+            {
+                return;
+            }
+
+            var color = ThemeDictionaryBase.ParseThemeColor(themeColor);
+            var properties = TextFormattingRunProperties.CreateTextFormattingRunProperties()
+                .SetForeground(color);
+            if (withBackground)
+            {
+                properties = properties.SetBackground(color);
+            }
+
+            formatMap.SetExplicitTextProperties(type, properties);
+        }
+    }
+
+    /// <summary>
+    /// Feeds the theme's editor background to the "TextView Background" editor-format entry
+    /// (the standard VS Fonts-and-Colors item; recompiled Roslyn code reads it, e.g. inline
+    /// diagnostics adapting severity icons to the background).
+    /// </summary>
+    public void ApplyTextViewBackground(IEditorFormatMap formatMap)
+    {
+        if (Background is { } background)
+        {
+            var properties = new Avalonia.Controls.ResourceDictionary
+            {
+                [EditorFormatDefinition.BackgroundColorId] = background,
+            };
+            formatMap.SetProperties("TextView Background", properties);
+        }
     }
 
     private void ApplyMarker(IEditorFormatMap formatMap, string markerName, string backgroundKey, string borderKey)

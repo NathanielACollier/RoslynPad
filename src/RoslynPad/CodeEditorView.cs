@@ -4,6 +4,9 @@ using Microsoft.CodeAnalysis.Text;
 using Microsoft.VisualStudio.Text;
 using Microsoft.VisualStudio.Text.Classification;
 using Microsoft.VisualStudio.Text.Editor;
+using Microsoft.VisualStudio.Text.Editor.Commanding;
+using Microsoft.VisualStudio.Text.Editor.Commanding.Commands;
+using Microsoft.VisualStudio.Text.Outlining;
 using Microsoft.VisualStudio.Utilities;
 using RoslynPad.Editor;
 using RoslynPad.UI;
@@ -22,6 +25,7 @@ internal sealed class CodeEditorView : ContentControl, IDisposable
     private IClassificationFormatMap? _formatMap;
     private IClassificationTypeRegistryService? _classificationRegistry;
     private IEditorFormatMap? _editorFormatMap;
+    private IOutliningManager? _outliningManager;
 
     public ITextBuffer? Buffer { get; private set; }
     public IWpfTextView? TextView { get; private set; }
@@ -58,6 +62,7 @@ internal sealed class CodeEditorView : ContentControl, IDisposable
         _formatMap = exportProvider.GetExportedValue<IClassificationFormatMapService>().GetClassificationFormatMap(textView);
         _classificationRegistry = exportProvider.GetExportedValue<IClassificationTypeRegistryService>();
         _editorFormatMap = exportProvider.GetExportedValue<IEditorFormatMapService>().GetEditorFormatMap(textView);
+        _outliningManager = exportProvider.GetExportedValue<IOutliningManagerService>().GetOutliningManager(textView);
 
         ApplyFontSettings(mainViewModel.Settings.EditorFontFamily, mainViewModel.EditorFontSize);
         ApplyTheme();
@@ -94,6 +99,8 @@ internal sealed class CodeEditorView : ContentControl, IDisposable
         var snapshotSpan = new SnapshotSpan(snapshot, Span.FromBounds(
             Math.Min(span.Start, snapshot.Length), Math.Min(span.End, snapshot.Length)));
 
+        // A target inside a collapsed region would land on hidden text.
+        _outliningManager?.ExpandAll(snapshotSpan, static _ => true);
         textView.Selection.Select(snapshotSpan, isReversed: false);
         textView.Caret.MoveTo(snapshotSpan.End);
         textView.ViewScroller.EnsureSpanVisible(snapshotSpan, EnsureSpanVisibleOptions.AlwaysCenter);
@@ -101,6 +108,22 @@ internal sealed class CodeEditorView : ContentControl, IDisposable
     }
 
     public void FocusEditor() => TextView?.VisualElement.Focus();
+
+    /// <summary>Starts an inline rename session at the caret, as if F2 was pressed in the view.</summary>
+    public void InvokeRename()
+    {
+        if (TextView is not { } textView || _mainViewModel is not { } mainViewModel)
+        {
+            return;
+        }
+
+        // Typing edits the rename field in the buffer, so the editor must own focus even when
+        // rename was invoked from the toolbar or menu.
+        FocusEditor();
+        mainViewModel.RoslynHost.ExportProvider.GetExportedValue<IEditorCommandHandlerServiceFactory>()
+            .GetService(textView)
+            .Execute(static (v, b) => new RenameCommandArgs(v, b), static () => { });
+    }
 
     public void ApplyFontSettings(string fontFamilies, double fontSize)
     {
@@ -146,15 +169,21 @@ internal sealed class CodeEditorView : ContentControl, IDisposable
 
         var theme = new ThemeClassificationFormats(mainViewModel.Theme);
         theme.Apply(formatMap, registry);
+        theme.ApplyInlineDiagnostics(formatMap, registry);
 
         if (_editorFormatMap is { } editorFormatMap)
         {
+            theme.ApplyTextViewBackground(editorFormatMap);
             theme.ApplyPopup(editorFormatMap);
             theme.ApplyBraceMatching(editorFormatMap);
             theme.ApplyReferenceHighlighting(editorFormatMap);
+            theme.ApplyInlineRename(editorFormatMap);
             theme.ApplyCaret(editorFormatMap);
+            theme.ApplySelection(editorFormatMap);
             theme.ApplyFindReplace(editorFormatMap);
             theme.ApplyBackgroundWorkIndicator(editorFormatMap);
+            theme.ApplyBlockStructure(editorFormatMap);
+            theme.ApplyOutlining(editorFormatMap);
         }
 
         // Glyph drawings (completion icons, quick info symbols, the light bulb) adapt their

@@ -125,9 +125,11 @@ internal sealed class WpfTextView : Panel, IWpfTextView, ITextView2
         // No ClipToBounds here: the clip would apply in logical (pre-zoom) coordinates,
         // cutting the view short of its slot when zoomed out. The host wraps the view in
         // a clipping decorator that operates in screen coordinates.
-        Focusable = true;
+        // A view without the Interactive role (e.g. a tooltip preview) responds to no user
+        // input: it takes no focus and shows no caret.
+        Focusable = _roles.Contains(PredefinedTextViewRoles.Interactive);
 
-        _caret = new TextCaret(this, bufferGraph);
+        _caret = new TextCaret(this, bufferGraph, isHidden: !Focusable);
         _selection = new TextSelection(this);
         _viewScroller = new ViewScroller(this);
         _spaceReservationStack = new SpaceReservationStack(this);
@@ -143,6 +145,7 @@ internal sealed class WpfTextView : Panel, IWpfTextView, ITextView2
         classificationFormatMap.ClassificationFormatMappingChanged += OnFormatMappingChanged;
         editorFormatMap.FormatMappingChanged += OnEditorFormatMappingChanged;
         _caretLayer.UpdateBrushes(editorFormatMap);
+        _selectionLayer.UpdateBrushes(editorFormatMap);
         options.OptionChanged += OnOptionChanged;
         ApplyZoomLevel(options.GetOptionValue(DefaultTextViewOptions.ZoomLevelId));
 
@@ -734,11 +737,6 @@ internal sealed class WpfTextView : Panel, IWpfTextView, ITextView2
             _inLayout = false;
         }
 
-        foreach (var layer in _adornmentLayers.Values)
-        {
-            layer.OnLayoutChanged();
-        }
-
         // Classify per the contract: reused rows that moved are translations; only fresh
         // rows are new-or-reformatted.
         var newOrReformatted = new List<ITextViewLine>();
@@ -765,6 +763,13 @@ internal sealed class WpfTextView : Panel, IWpfTextView, ITextView2
                 line.SetChange(TextViewLineChange.NewOrReformatted);
                 newOrReformatted.Add(line);
             }
+        }
+
+        // Layers see fresh line-change flags so text-relative adornments on reformatted
+        // lines are dropped (VS contract) before the LayoutChanged event re-adds them.
+        foreach (var layer in _adornmentLayers.Values)
+        {
+            layer.OnLayoutChanged(removeReformatted: true);
         }
 
         var newState = new ViewState(this);
@@ -1100,6 +1105,46 @@ internal sealed class WpfTextView : Panel, IWpfTextView, ITextView2
 
     #region Avalonia integration
 
+    protected override Size MeasureOverride(Size availableSize)
+    {
+        var size = base.MeasureOverride(availableSize);
+        if (_isClosed || (!double.IsInfinity(availableSize.Width) && !double.IsInfinity(availableSize.Height)))
+        {
+            return size;
+        }
+
+        // Unconstrained measure: a popup (e.g. the collapsed-region hint) is sizing the
+        // view to its content. Answer the full text size on the unbounded axes — the
+        // viewport-driven layout only formats visible lines, so anything that waits for a
+        // layout pass to read the text extent under-measures. Viewport hosting never gets
+        // here (a viewport is a finite constraint by definition); content-sized hosts show
+        // small buffers, so formatting every line to find the widest is affordable.
+        var source = EnsureLineSource();
+        var snapshot = VisualSnapshot;
+        double scale = _zoomLevel / 100.0;
+
+        double width = size.Width;
+        if (double.IsInfinity(availableSize.Width))
+        {
+            width = 0.0;
+            for (int i = 0; i < snapshot.LineCount; i++)
+            {
+                foreach (var row in FormatSnapshotLine(source, snapshot.GetLineFromLineNumber(i)))
+                {
+                    width = Math.Max(width, row.TextWidth);
+                    row.Dispose();
+                }
+            }
+
+            width = (width + source.ColumnWidth) * scale;
+        }
+
+        double height = double.IsInfinity(availableSize.Height)
+            ? snapshot.LineCount * source.LineHeight * scale
+            : size.Height;
+        return new Size(width, height);
+    }
+
     protected override Size ArrangeOverride(Size finalSize)
     {
         // The viewport is in logical (pre-zoom) units; the render transform maps it onto
@@ -1153,7 +1198,10 @@ internal sealed class WpfTextView : Panel, IWpfTextView, ITextView2
     protected override void OnPointerWheelChanged(PointerWheelEventArgs e)
     {
         base.OnPointerWheelChanged(e);
-        HandleMouseWheel(e);
+        if (AllowsUserInput)
+        {
+            HandleMouseWheel(e);
+        }
     }
 
     /// <summary>
@@ -1196,9 +1244,17 @@ internal sealed class WpfTextView : Panel, IWpfTextView, ITextView2
         AvaloniaClipboardBridge.Instance.Attach(TopLevel.GetTopLevel(this));
     }
 
+    /// <summary>Whether the view responds to user input (the Interactive role).</summary>
+    private bool AllowsUserInput => _roles.Contains(PredefinedTextViewRoles.Interactive);
+
     protected override void OnTextInput(TextInputEventArgs e)
     {
         base.OnTextInput(e);
+        if (!AllowsUserInput)
+        {
+            return;
+        }
+
         if (!_isClosed && !e.Handled && !string.IsNullOrEmpty(e.Text) && !char.IsControl(e.Text[0]))
         {
             if (!Options.DoesViewProhibitUserInput())
@@ -1213,6 +1269,11 @@ internal sealed class WpfTextView : Panel, IWpfTextView, ITextView2
     protected override void OnKeyDown(KeyEventArgs e)
     {
         base.OnKeyDown(e);
+        if (!AllowsUserInput)
+        {
+            return;
+        }
+
         if (!_isClosed && !e.Handled)
         {
             e.Handled = HandleKey(e.Key, e.KeyModifiers);
@@ -1379,7 +1440,7 @@ internal sealed class WpfTextView : Panel, IWpfTextView, ITextView2
     protected override void OnPointerPressed(PointerPressedEventArgs e)
     {
         base.OnPointerPressed(e);
-        if (_isClosed || e.Handled)
+        if (_isClosed || e.Handled || !AllowsUserInput)
         {
             return;
         }
@@ -1395,6 +1456,7 @@ internal sealed class WpfTextView : Panel, IWpfTextView, ITextView2
         {
             bool addCaret = e.KeyModifiers.HasFlag(KeyModifiers.Alt) || e.KeyModifiers.HasFlag(KeyModifiers.Meta);
             bool extend = e.KeyModifiers.HasFlag(KeyModifiers.Shift);
+            _wordDragAnchor = null;
             if (box)
             {
                 // The box anchors at the press point (VS Code's Option+Shift+drag); dragging
@@ -1411,13 +1473,12 @@ internal sealed class WpfTextView : Panel, IWpfTextView, ITextView2
             }
             else if (e.ClickCount == 2)
             {
-                // Double-click selects the word under the click; no capture, so the
-                // press-release of the second click can't collapse the selection
-                // (word-by-word drag extension is mouse-processor work, §5.6).
+                // Double-click selects the word under the click; the selected word becomes
+                // the anchor for word-by-word drag extension (VS semantics), which also
+                // keeps the second click's press-release from collapsing the selection.
                 MultiSelectionBroker.SetSelection(new Microsoft.VisualStudio.Text.Selection(position));
                 EditorOperations.SelectCurrentWord();
-                e.Handled = true;
-                return;
+                _wordDragAnchor = _selection.StreamSelectionSpan.SnapshotSpan;
             }
             else
             {
@@ -1433,24 +1494,16 @@ internal sealed class WpfTextView : Panel, IWpfTextView, ITextView2
     protected override void OnPointerMoved(PointerEventArgs e)
     {
         base.OnPointerMoved(e);
-        if (_isClosed)
+        if (_isClosed || !AllowsUserInput)
         {
             return;
         }
 
-        if (ReferenceEquals(e.Pointer.Captured, this)
-            && GetBufferPositionFromViewPoint(e.GetPosition(this), MultiSelectionBroker.IsBoxSelection) is { } position)
+        if (ReferenceEquals(e.Pointer.Captured, this))
         {
-            if (MultiSelectionBroker.IsBoxSelection)
-            {
-                MultiSelectionBroker.SetBoxSelection(
-                    new Microsoft.VisualStudio.Text.Selection(MultiSelectionBroker.BoxSelection.AnchorPoint, position));
-            }
-            else
-            {
-                MultiSelectionBroker.SetSelection(new Microsoft.VisualStudio.Text.Selection(_selection.AnchorPoint, position));
-            }
-
+            _dragPoint = e.GetPosition(this);
+            ExtendDragSelection(_dragPoint);
+            UpdateDragAutoScroll();
             return;
         }
 
@@ -1475,10 +1528,108 @@ internal sealed class WpfTextView : Panel, IWpfTextView, ITextView2
     protected override void OnPointerReleased(PointerReleasedEventArgs e)
     {
         base.OnPointerReleased(e);
+        _dragScrollTimer?.Stop();
         if (ReferenceEquals(e.Pointer.Captured, this))
         {
             e.Pointer.Capture(null);
         }
+    }
+
+    protected override void OnPointerCaptureLost(PointerCaptureLostEventArgs e)
+    {
+        base.OnPointerCaptureLost(e);
+        _dragScrollTimer?.Stop();
+    }
+
+    private DispatcherTimer? _dragScrollTimer;
+    private Point _dragPoint;
+    private SnapshotSpan? _wordDragAnchor;
+
+    private void ExtendDragSelection(Point point)
+    {
+        if (GetBufferPositionFromViewPoint(point, MultiSelectionBroker.IsBoxSelection) is { } position)
+        {
+            if (MultiSelectionBroker.IsBoxSelection)
+            {
+                MultiSelectionBroker.SetBoxSelection(
+                    new Microsoft.VisualStudio.Text.Selection(MultiSelectionBroker.BoxSelection.AnchorPoint, position));
+            }
+            else if (_wordDragAnchor is { } wordAnchor)
+            {
+                // Dragging out of a double-click extends whole-word-by-whole-word: the
+                // selection is the union of the anchor word and the word (or run of
+                // punctuation/whitespace) under the pointer, anchored at the far end.
+                var anchor = wordAnchor.TranslateTo(position.Position.Snapshot, SpanTrackingMode.EdgeInclusive);
+                var word = _factory.GetTextStructureNavigator(position.Position.Snapshot.TextBuffer)
+                    .GetExtentOfWord(position.Position).Span;
+                var (anchorPoint, activePoint) = word.Start < anchor.Start
+                    ? (anchor.End, word.Start)
+                    : (anchor.Start, word.End > anchor.End ? word.End : anchor.End);
+                MultiSelectionBroker.SetSelection(new Microsoft.VisualStudio.Text.Selection(
+                    new VirtualSnapshotPoint(anchorPoint), new VirtualSnapshotPoint(activePoint)));
+            }
+            else
+            {
+                MultiSelectionBroker.SetSelection(new Microsoft.VisualStudio.Text.Selection(_selection.AnchorPoint, position));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Auto-scroll while drag-selecting past the viewport edges: the drag point clamps to the
+    /// formatted lines, so without scrolling the selection would stall at the edge. A timer
+    /// scrolls by the pointer's overshoot for as long as the captured pointer stays outside
+    /// (speed grows with distance, VS semantics) — the pointer resting outside produces no
+    /// further move events, hence a timer rather than scrolling from OnPointerMoved.
+    /// </summary>
+    private void UpdateDragAutoScroll()
+    {
+        if (GetDragOvershoot() == default)
+        {
+            _dragScrollTimer?.Stop();
+            return;
+        }
+
+        if (_dragScrollTimer is null)
+        {
+            _dragScrollTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
+            _dragScrollTimer.Tick += (_, _) => OnDragScrollTimerTick();
+        }
+
+        _dragScrollTimer.Start();
+    }
+
+    private void OnDragScrollTimerTick()
+    {
+        var (x, y) = _isClosed ? default : GetDragOvershoot();
+        if (x == 0.0 && y == 0.0)
+        {
+            _dragScrollTimer!.Stop();
+            return;
+        }
+
+        if (y != 0.0)
+        {
+            _viewScroller.ScrollViewportVerticallyByPixels(-y);
+        }
+
+        if (x != 0.0)
+        {
+            ViewportLeft += x;
+        }
+
+        ExtendDragSelection(_dragPoint);
+    }
+
+    private (double X, double Y) GetDragOvershoot()
+    {
+        double x = _dragPoint.X < 0.0 ? _dragPoint.X
+            : _dragPoint.X > ViewportWidth ? _dragPoint.X - ViewportWidth
+            : 0.0;
+        double y = _dragPoint.Y < ViewportTop ? _dragPoint.Y - ViewportTop
+            : _dragPoint.Y > ViewportBottom ? _dragPoint.Y - ViewportBottom
+            : 0.0;
+        return (x, y);
     }
 
     /// <summary>
@@ -1566,8 +1717,11 @@ internal sealed class WpfTextView : Panel, IWpfTextView, ITextView2
         QueueRelayout();
     }
 
-    private void OnEditorFormatMappingChanged(object? sender, FormatItemsEventArgs e) =>
+    private void OnEditorFormatMappingChanged(object? sender, FormatItemsEventArgs e)
+    {
         _caretLayer.UpdateBrushes(_editorFormatMap);
+        _selectionLayer.UpdateBrushes(_editorFormatMap);
+    }
 
     private void OnOptionChanged(object? sender, EditorOptionChangedEventArgs e)
     {

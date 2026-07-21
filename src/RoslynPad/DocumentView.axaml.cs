@@ -56,6 +56,7 @@ partial class DocumentView : UserControl, IDisposable
 
         viewModel.ReadInput += OnReadInput;
         viewModel.EditorFocus += (o, e) => FocusEditor();
+        viewModel.RenameRequested += (o, e) => _editor.InvokeRename();
         viewModel.NavigationRequested += span => _editor.NavigateToSpan(span);
         viewModel.FindRequested += (o, e) => FindReplace?.Show(showReplace: false);
         viewModel.FindReplaceRequested += (o, e) => FindReplace?.Show(showReplace: true);
@@ -63,8 +64,6 @@ partial class DocumentView : UserControl, IDisposable
         var documentText = await viewModel.LoadTextAsync().ConfigureAwait(true);
 
         var roslynHost = viewModel.MainViewModel.RoslynHost;
-
-        Morgania.CodeAnalysis.Editor.DiagnosticsSquiggles.DisabledDiagnostics = roslynHost.DisabledDiagnostics;
 
         var buffer = _editor.CreateBuffer(viewModel.MainViewModel, documentText);
         _buffer = buffer;
@@ -166,7 +165,6 @@ partial class DocumentView : UserControl, IDisposable
         {
             Header = "Console Input",
             Content = textBox,
-            Background = Brushes.White,
         };
 
         textBox.Loaded += (o, e) => textBox.Focus();

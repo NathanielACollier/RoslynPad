@@ -2,6 +2,8 @@ using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.VisualTree;
 using Microsoft.CodeAnalysis.Completion.Providers.Snippets;
 using Microsoft.CodeAnalysis.Editor.Implementation.IntelliSense.AsyncCompletion;
+using Microsoft.CodeAnalysis.Editor.Implementation.InlineRename;
+using Microsoft.CodeAnalysis.Editor.Implementation.InlineRename.HighlightTags;
 using Microsoft.VisualStudio.Composition;
 using Microsoft.VisualStudio.Language.Intellisense.AsyncCompletion;
 using Microsoft.VisualStudio.Language.Intellisense.AsyncCompletion.Data;
@@ -38,10 +40,15 @@ internal static class SmokeTest
             await VerifySnippetCommitAsync(exportProvider, view, buffer).ConfigureAwait(true);
             await VerifySignatureHelpAsync(exportProvider, view, buffer).ConfigureAwait(true);
             await VerifyDiagnosticsAsync(exportProvider, view, buffer).ConfigureAwait(true);
+            await VerifyInlineDiagnosticsAsync(exportProvider, view, desktop).ConfigureAwait(true);
             await VerifyQuickFixAsync(exportProvider, view, buffer).ConfigureAwait(true);
             VerifyMultiCaret(exportProvider, view, buffer);
             await VerifyBraceMatchingAsync(exportProvider, view, buffer).ConfigureAwait(true);
             await VerifyReferenceHighlightingAsync(exportProvider, view, buffer).ConfigureAwait(true);
+            await VerifyStringIndentationAsync(exportProvider, view, buffer).ConfigureAwait(true);
+            await VerifyBlockStructureAsync(exportProvider, view, buffer).ConfigureAwait(true);
+            await VerifyOutliningAsync(exportProvider, view, buffer, desktop).ConfigureAwait(true);
+            await VerifyInlineRenameAsync(exportProvider, view, buffer).ConfigureAwait(true);
             Console.WriteLine("SMOKE PASSED");
             exitCode = 0;
         }
@@ -330,7 +337,7 @@ internal static class SmokeTest
             .First();
         var runs = signatureBlock.Inlines!.OfType<Avalonia.Controls.Documents.Run>().ToList();
 
-        var keywordColor = Avalonia.Media.Color.FromRgb(0x56, 0x9C, 0xD6);
+        var keywordColor = Avalonia.Media.Color.FromRgb(0x00, 0x00, 0xFF);
         var voidRun = runs.FirstOrDefault(run => run.Text == "void");
         if (voidRun is null || (voidRun.Foreground as Avalonia.Media.ISolidColorBrush)?.Color != keywordColor)
         {
@@ -387,6 +394,78 @@ internal static class SmokeTest
         }
 
         throw new TimeoutException("no error squiggle tag appeared over the bad identifier");
+    }
+
+    /// <summary>
+    /// Enables the inline-diagnostics option (recompiled Roslyn feature, off by default) while
+    /// the 'Conosle' error is still in the buffer, and waits for the adornment manager to draw
+    /// the message pill into its own layer: severity icon (CrispImage over the image catalog),
+    /// the diagnostic id as a link, and the message text. The manager skips the pill when it
+    /// would overlap the code (VS behavior), so the window is widened for the duration.
+    /// </summary>
+    private static async Task VerifyInlineDiagnosticsAsync(
+        ExportProvider exportProvider, IWpfTextView view, IClassicDesktopStyleApplicationLifetime desktop)
+    {
+        var window = desktop.MainWindow ?? throw new InvalidOperationException("no main window");
+        var originalWidth = window.Width;
+        window.Width = 1800;
+
+        var globalOptions = exportProvider.GetExportedValue<Microsoft.CodeAnalysis.Options.IGlobalOptionService>();
+        globalOptions.SetGlobalOption(
+            Microsoft.CodeAnalysis.Editor.InlineDiagnostics.InlineDiagnosticsOptionsStorage.EnableInlineDiagnostics,
+            Microsoft.CodeAnalysis.LanguageNames.CSharp,
+            true);
+
+        var layer = view.GetAdornmentLayer("RoslynInlineDiagnostics");
+        for (var i = 0; i < 120 && layer.IsEmpty; i++)
+        {
+            await Task.Delay(500).ConfigureAwait(true);
+        }
+
+        if (layer.IsEmpty)
+        {
+            throw new TimeoutException("no inline diagnostic adornment was drawn");
+        }
+
+        var adornment = layer.Elements[0].Adornment;
+
+        // The pill belongs after the end of its line, not over the code (the layer must
+        // honor the manager's Canvas coordinates rather than snapping to the span start).
+        var errorPosition = view.TextSnapshot.GetText().IndexOf("Conosle", StringComparison.Ordinal);
+        var errorLine = view.TextViewLines.GetTextViewLineContainingBufferPosition(new SnapshotPoint(view.TextSnapshot, errorPosition))
+            ?? throw new InvalidOperationException("error line is not in the layout");
+        var left = Avalonia.Controls.Canvas.GetLeft(adornment);
+        var expectedLeft = errorLine.Right - view.ViewportLeft;
+        if (Math.Abs(left - expectedLeft) > 1.0)
+        {
+            throw new InvalidOperationException($"inline diagnostic pill is misplaced: Canvas.Left={left:F1}, line end={expectedLeft:F1}");
+        }
+        var text = string.Join(string.Empty, adornment.GetVisualDescendants()
+            .OfType<Avalonia.Controls.TextBlock>()
+            .SelectMany(block => block.Inlines?.Count > 0
+                ? block.Inlines.OfType<Avalonia.Controls.Documents.Run>().Select(run => run.Text)
+                : [block.Text]));
+        if (!text.Contains("Conosle", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException($"inline diagnostic text does not mention the bad identifier: '{text}'");
+        }
+
+        var icon = adornment.GetVisualDescendants().OfType<Avalonia.Controls.Image>().FirstOrDefault();
+        if (icon?.Source is null)
+        {
+            throw new InvalidOperationException("inline diagnostic severity icon did not resolve from the image catalog");
+        }
+
+        var link = adornment.GetVisualDescendants()
+            .OfType<Microsoft.VisualStudio.Text.Adornments.Implementation.NavigationTextBlock>()
+            .FirstOrDefault();
+        Console.WriteLine($"inline diagnostics OK: '{text.Trim()}', icon resolved, id link {(link is null ? "absent (no help URI)" : $"'{link.Text}'")}");
+
+        globalOptions.SetGlobalOption(
+            Microsoft.CodeAnalysis.Editor.InlineDiagnostics.InlineDiagnosticsOptionsStorage.EnableInlineDiagnostics,
+            Microsoft.CodeAnalysis.LanguageNames.CSharp,
+            false);
+        window.Width = originalWidth;
     }
 
     /// <summary>
@@ -659,6 +738,389 @@ internal static class SmokeTest
         }
 
         Console.WriteLine("reference highlighting OK: definition, reads, and write tagged and drawn");
+    }
+
+    /// <summary>
+    /// Inserts a raw string literal and waits for the recompiled StringIndentationAdornmentManager
+    /// to draw the vertical indentation guide. The guide is a Line whose geometry is authored in
+    /// text coordinates with no Canvas position, so the layer must render it at the text-space
+    /// origin rather than snapping it to the visual span's leading edge. Verifies the guide lands
+    /// just left of the closing delimiter's column, between the delimiter lines.
+    /// </summary>
+    private static async Task VerifyStringIndentationAsync(ExportProvider exportProvider, IWpfTextView view, ITextBuffer buffer)
+    {
+        var insertPosition = buffer.CurrentSnapshot.GetText().IndexOf("    public void Greet()", StringComparison.Ordinal);
+        buffer.Insert(insertPosition,
+            "    private const string Json = \"\"\"\n" +
+            "          {\n" +
+            "            \"n\": 1\n" +
+            "          }\n" +
+            "        \"\"\";\n\n");
+
+        var aggregatorFactory = exportProvider.GetExportedValue<IViewTagAggregatorFactoryService>();
+        using var aggregator = aggregatorFactory
+            .CreateTagAggregator<Microsoft.CodeAnalysis.Editor.Implementation.StringIndentation.StringIndentationTag>(view);
+        var layer = view.GetAdornmentLayer("RoslynStringIndentation");
+
+        await WaitForGuideAsync("initial").ConfigureAwait(true);
+
+        // Re-indent every line of the literal below the opening delimiter: the guide moves
+        // right, and the layer must drop the old guide when the reformatted lines lay out
+        // again (stale guides accumulated otherwise).
+        var text = buffer.CurrentSnapshot.GetText();
+        var literalStart = text.IndexOf("string Json", StringComparison.Ordinal);
+        var firstLine = buffer.CurrentSnapshot.GetLineFromPosition(literalStart).LineNumber;
+        var lastLine = buffer.CurrentSnapshot.GetLineFromPosition(text.IndexOf("\"\"\";", literalStart, StringComparison.Ordinal)).LineNumber;
+        using (var edit = buffer.CreateEdit())
+        {
+            for (var line = firstLine + 1; line <= lastLine; line++)
+            {
+                edit.Insert(buffer.CurrentSnapshot.GetLineFromLineNumber(line).Start, "    ");
+            }
+
+            edit.Apply();
+        }
+
+        await WaitForGuideAsync("after re-indent").ConfigureAwait(true);
+
+        async Task WaitForGuideAsync(string label)
+        {
+            Exception? failure = null;
+            for (var i = 0; i < 60; i++)
+            {
+                await Task.Delay(500).ConfigureAwait(true);
+                failure = CheckGuide(label);
+                if (failure is null)
+                {
+                    return;
+                }
+            }
+
+            if (failure is not null)
+            {
+                throw failure;
+            }
+        }
+
+        // Recomputes the manager's geometry (x just left of the closing delimiter's quote,
+        // spanning from below the opening line to above the closing line) and requires the
+        // layer to hold exactly that one guide.
+        Exception? CheckGuide(string label)
+        {
+            var snapshot = view.TextSnapshot;
+            var tagSpan = aggregator
+                .GetTags(new SnapshotSpan(snapshot, 0, snapshot.Length))
+                .SelectMany(tag => tag.Span.GetSpans(snapshot))
+                .FirstOrDefault();
+            if (tagSpan.IsEmpty)
+            {
+                return new TimeoutException($"no string-indentation tag over the raw string literal ({label})");
+            }
+
+            var guides = layer.Elements.Select(element => element.Adornment).OfType<Avalonia.Controls.Shapes.Line>().ToList();
+            if (guides.Count != 1 || guides.Count != layer.Elements.Count)
+            {
+                return new InvalidOperationException(
+                    $"expected exactly one guide Line on the layer, found {layer.Elements.Count} adornments ({guides.Count} Lines) ({label})");
+            }
+
+            var anchorLine = view.GetTextViewLineContainingBufferPosition(tagSpan.End - 1);
+            var bounds = anchorLine.GetCharacterBounds(tagSpan.End - 1);
+            var expectedX = Math.Floor(bounds.Right - (anchorLine.VirtualSpaceWidth / 2)) - view.ViewportLeft;
+            var expectedTop = view.TextViewLines.GetTextViewLineContainingBufferPosition(tagSpan.Start).Bottom - view.ViewportTop;
+            var expectedBottom = view.TextViewLines.GetTextViewLineContainingBufferPosition(tagSpan.End).Top - view.ViewportTop;
+
+            var guide = guides[0];
+            var renderedX = Avalonia.Controls.Canvas.GetLeft(guide) + guide.StartPoint.X;
+            var renderedTop = Avalonia.Controls.Canvas.GetTop(guide) + guide.StartPoint.Y;
+            var renderedBottom = Avalonia.Controls.Canvas.GetTop(guide) + guide.EndPoint.Y;
+            if (Math.Abs(renderedX - expectedX) > 1.0
+                || Math.Abs(renderedTop - expectedTop) > 2.5
+                || Math.Abs(renderedBottom - expectedBottom) > 2.5)
+            {
+                return new InvalidOperationException(
+                    $"string-indentation guide is misplaced ({label}): x={renderedX:F1} (expected {expectedX:F1}), y={renderedTop:F1}-{renderedBottom:F1} (expected {expectedTop:F1}-{expectedBottom:F1})");
+            }
+
+            Console.WriteLine($"string indentation OK ({label}): guide at x={renderedX:F1} spanning y={renderedTop:F1}-{renderedBottom:F1}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Waits for Roslyn's structure tagger to produce structural block tags (class, methods,
+    /// for-loop) and for BlockStructureAdornmentManager to draw the vertical guide lines.
+    /// Verifies every drawn guide is anchored at the first non-whitespace character of some
+    /// structural block header's start line, and that guides exist at several distinct
+    /// indent levels.
+    /// </summary>
+    private static async Task VerifyBlockStructureAsync(ExportProvider exportProvider, IWpfTextView view, ITextBuffer buffer)
+    {
+        var aggregatorFactory = exportProvider.GetExportedValue<IViewTagAggregatorFactoryService>();
+        using var aggregator = aggregatorFactory.CreateTagAggregator<IStructureTag>(view);
+        var layer = view.GetAdornmentLayer(PredefinedAdornmentLayers.BlockStructure);
+
+        Exception? failure = null;
+        for (var i = 0; i < 120; i++)
+        {
+            await Task.Delay(500).ConfigureAwait(true);
+            failure = CheckGuides();
+            if (failure is null)
+            {
+                return;
+            }
+        }
+
+        if (failure is not null)
+        {
+            throw failure;
+        }
+
+        Exception? CheckGuides()
+        {
+            var snapshot = view.TextSnapshot;
+            var structuralTags = aggregator
+                .GetTags(new SnapshotSpan(snapshot, 0, snapshot.Length))
+                .Select(tag => tag.Tag)
+                .Where(tag => tag.Type != Microsoft.VisualStudio.Text.Adornments.PredefinedStructureTagTypes.Nonstructural
+                    && tag.HeaderSpan is not null)
+                .ToList();
+            if (structuralTags.Count < 3)
+            {
+                return new TimeoutException($"expected structural tags for class/methods/loop, got {structuralTags.Count}");
+            }
+
+            if (layer.IsEmpty)
+            {
+                return new TimeoutException("structural tags present but no block structure guide was drawn");
+            }
+
+            var expectedAnchors = structuralTags
+                .Select(tag =>
+                {
+                    var header = new SnapshotSpan(tag.Snapshot, tag.HeaderSpan!.Value).TranslateTo(snapshot, SpanTrackingMode.EdgeExclusive);
+                    var headerLineText = header.Start.GetContainingLine().GetText();
+                    var anchor = header.Start.GetContainingLine().Start + (headerLineText.Length - headerLineText.TrimStart().Length);
+                    var line = view.GetTextViewLineContainingBufferPosition(anchor);
+                    return Math.Floor(line.GetCharacterBounds(anchor).Left) - view.ViewportLeft;
+                })
+                .Distinct()
+                .ToList();
+
+            List<double> renderedXs = [];
+            foreach (var element in layer.Elements)
+            {
+                if (element.Adornment is not Avalonia.Controls.Shapes.Line guide)
+                {
+                    return new InvalidOperationException($"expected only Line adornments on the layer, got {element.Adornment}");
+                }
+
+                var x = Avalonia.Controls.Canvas.GetLeft(guide) + guide.StartPoint.X;
+                if (!expectedAnchors.Any(expected => Math.Abs(expected - x) <= 1.0))
+                {
+                    return new InvalidOperationException(
+                        $"guide at x={x:F1} does not match any block header anchor ({string.Join(", ", expectedAnchors.Select(a => a.ToString("F1")))})");
+                }
+
+                renderedXs.Add(x);
+            }
+
+            var distinctLevels = renderedXs.Distinct().Count();
+            if (distinctLevels < 3)
+            {
+                return new TimeoutException($"expected guides at 3+ indent levels (class/method/loop), got {distinctLevels}");
+            }
+
+            Console.WriteLine(
+                $"block structure OK: {layer.Elements.Count} guide segments at {distinctLevels} indent levels from {structuralTags.Count} structural tags");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Waits for Roslyn's structure tags to reach the outlining manager (through the
+    /// structure→outlining bridge), collapses the innermost region, and verifies the
+    /// collapse elides all but the region's last character and draws the collapsed-form
+    /// pill in the intra-text adornment layer; expanding restores the visual buffer.
+    /// </summary>
+    private static async Task VerifyOutliningAsync(
+        ExportProvider exportProvider, IWpfTextView view, ITextBuffer buffer, IClassicDesktopStyleApplicationLifetime desktop)
+    {
+        var manager = exportProvider
+            .GetExportedValue<Microsoft.VisualStudio.Text.Outlining.IOutliningManagerService>()
+            .GetOutliningManager(view)
+            ?? throw new InvalidOperationException("the view has no outlining manager");
+
+        Microsoft.VisualStudio.Text.Outlining.ICollapsible? region = null;
+        for (var i = 0; i < 120 && region is null; i++)
+        {
+            await Task.Delay(500).ConfigureAwait(true);
+            var snapshot = buffer.CurrentSnapshot;
+            region = manager.GetAllRegions(new SnapshotSpan(snapshot, 0, snapshot.Length))
+                .OrderBy(r => r.Extent.GetSpan(snapshot).Length)
+                .FirstOrDefault();
+        }
+
+        if (region is null)
+        {
+            throw new TimeoutException("no outlining regions arrived from the Roslyn structure tags");
+        }
+
+        int editLength = buffer.CurrentSnapshot.Length;
+        var collapsed = manager.TryCollapse(region) ?? throw new InvalidOperationException("the region did not collapse");
+        var extent = collapsed.Extent.GetSpan(buffer.CurrentSnapshot);
+        if (view.VisualSnapshot.Length != editLength - (extent.Length - 1))
+        {
+            throw new InvalidOperationException(
+                $"collapse elided {editLength - view.VisualSnapshot.Length} characters, expected {extent.Length - 1}");
+        }
+
+        var pillLayer = view.GetAdornmentLayer("Intra Text Adornment");
+        for (var i = 0; i < 40 && pillLayer.IsEmpty; i++)
+        {
+            await Task.Delay(250).ConfigureAwait(true);
+        }
+
+        if (pillLayer.IsEmpty)
+        {
+            throw new TimeoutException("the collapsed-form pill was not drawn");
+        }
+
+        // The hover hint hosts a real text view over the hidden span (live classification,
+        // recolorizes when semantics land), not a static rendering.
+        if (collapsed.Tag.CollapsedHintForm is not Microsoft.CodeAnalysis.Editor.Shared.Utilities.ViewHostingControl hintControl)
+        {
+            throw new InvalidOperationException($"expected a view-hosting hint, got {collapsed.Tag.CollapsedHintForm?.GetType().Name}");
+        }
+
+        // Attach the hint (as a tooltip opening would) so the elision buffer and shrunken
+        // view materialize, and check the preview shows the collapsed code.
+        var window = desktop.MainWindow ?? throw new InvalidOperationException("no main window");
+        object? previousContent = window.Content;
+        window.Content = hintControl;
+        try
+        {
+            await Task.Delay(250).ConfigureAwait(true);
+            var hintView = (IWpfTextView)hintControl.TextView_TestOnly;
+
+            // The preview view is non-interactive: no focus, no caret.
+            if (hintView.VisualElement.Focusable || !hintView.Caret.IsHidden)
+            {
+                throw new InvalidOperationException("the hint view must not be focusable or show a caret");
+            }
+
+            string Strip(string text) => string.Concat(text.Where(c => !char.IsWhiteSpace(c)));
+            var hintText = Strip(hintView.TextSnapshot.GetText());
+            if (hintText.Length == 0 || !Strip(buffer.CurrentSnapshot.GetText()).Contains(hintText, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException("the hint view does not show the collapsed code");
+            }
+        }
+        finally
+        {
+            window.Content = previousContent;
+        }
+
+        manager.Expand(collapsed);
+        if (view.VisualSnapshot.Length != editLength)
+        {
+            throw new InvalidOperationException("expanding did not restore the visual buffer");
+        }
+
+        Console.WriteLine(
+            $"outlining OK: collapsed {extent.Length} characters behind the pill; hint hosts a text view; expand restored the view");
+    }
+
+    /// <summary>
+    /// Puts the caret on the for-loop variable and presses F2 through the key chain (bridge →
+    /// RenameCommandHandler → InlineRenameService). Waits for the session and for the rename-field
+    /// markers to be tagged, types a prefix — the session's linked spans propagate the edit to
+    /// every reference — and commits with Enter.
+    /// </summary>
+    private static async Task VerifyInlineRenameAsync(ExportProvider exportProvider, IWpfTextView view, ITextBuffer buffer)
+    {
+        var text = buffer.CurrentSnapshot.GetText();
+        var loopVariable = text.IndexOf("var i", text.IndexOf("for (", StringComparison.Ordinal), StringComparison.Ordinal) + "var ".Length;
+        view.Caret.MoveTo(new SnapshotPoint(buffer.CurrentSnapshot, loopVariable));
+
+        var renameService = exportProvider.GetExportedValue<InlineRenameService>();
+        RaiseKey(view, Avalonia.Input.Key.F2);
+
+        for (var i = 0; i < 60 && renameService.ActiveSession is null; i++)
+        {
+            await Task.Delay(250).ConfigureAwait(true);
+        }
+
+        if (renameService.ActiveSession is null)
+        {
+            throw new TimeoutException("F2 did not start an inline rename session");
+        }
+
+        var aggregatorFactory = exportProvider.GetExportedValue<IViewTagAggregatorFactoryService>();
+        using (var aggregator = aggregatorFactory.CreateTagAggregator<ITextMarkerTag>(view))
+        {
+            var fields = 0;
+            for (var i = 0; i < 60 && fields < 4; i++)
+            {
+                await Task.Delay(250).ConfigureAwait(true);
+                var snapshot = buffer.CurrentSnapshot;
+                fields = aggregator
+                    .GetTags(new SnapshotSpan(snapshot, 0, snapshot.Length))
+                    .Count(tag => tag.Tag.Type == RenameFieldBackgroundAndBorderTag.TagId);
+            }
+
+            if (fields < 4)
+            {
+                throw new TimeoutException($"expected 4 rename-field markers, got {fields}");
+            }
+        }
+
+        // Collapse the selection (session start may have selected the identifier) so typing
+        // appends deterministically: 'i' becomes 'ix' at every reference.
+        view.Selection.Clear();
+        view.Caret.MoveTo(new SnapshotPoint(buffer.CurrentSnapshot, loopVariable + 1));
+        view.VisualElement.RaiseEvent(new Avalonia.Input.TextInputEventArgs
+        {
+            RoutedEvent = Avalonia.Input.InputElement.TextInputEvent,
+            Text = "x",
+            Source = view.VisualElement,
+        });
+
+        static int CountRenamed(ITextBuffer buffer)
+            => System.Text.RegularExpressions.Regex.Matches(buffer.CurrentSnapshot.GetText(), @"\bix\b").Count;
+
+        for (var i = 0; i < 60 && CountRenamed(buffer) < 4; i++)
+        {
+            await Task.Delay(250).ConfigureAwait(true);
+        }
+
+        if (CountRenamed(buffer) < 4)
+        {
+            var snapshot = buffer.CurrentSnapshot;
+            var loopLine = snapshot.GetLineFromPosition(Math.Min(loopVariable, snapshot.Length)).GetText();
+            throw new TimeoutException($"typing in the rename field reached {CountRenamed(buffer)} of 4 references; loop line: '{loopLine}'");
+        }
+
+        // Typing may also have triggered completion; dismiss it so Enter commits the rename.
+        exportProvider.GetExportedValue<IAsyncCompletionBroker>().GetSession(view)?.Dismiss();
+        RaiseKey(view, Avalonia.Input.Key.Enter);
+
+        for (var i = 0; i < 60 && renameService.ActiveSession is not null; i++)
+        {
+            await Task.Delay(250).ConfigureAwait(true);
+        }
+
+        if (renameService.ActiveSession is not null)
+        {
+            throw new TimeoutException("Enter did not commit the inline rename session");
+        }
+
+        if (CountRenamed(buffer) != 4)
+        {
+            throw new InvalidOperationException($"expected 4 renamed references after commit, got {CountRenamed(buffer)}");
+        }
+
+        Console.WriteLine("inline rename OK: F2 session, 4 fields tagged, typed prefix propagated, Enter committed");
     }
 
     private static void RaiseKey(IWpfTextView view, Avalonia.Input.Key key, Avalonia.Input.KeyModifiers modifiers = Avalonia.Input.KeyModifiers.None)

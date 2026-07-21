@@ -25,9 +25,11 @@ public sealed class TextEditorFactoryService : ITextEditorFactoryService
     private readonly IMultiSelectionBrokerFactory _multiSelectionBrokerFactory;
     private readonly IEditorOperationsFactoryService _editorOperationsFactory;
     private readonly ITextBufferUndoManagerProvider _undoManagerProvider;
+    private readonly ITextStructureNavigatorSelectorService _navigatorSelectorService;
     private readonly ITextAndAdornmentSequencerFactoryService _sequencerFactory;
     private readonly Lazy<IWpfTextViewCreationListener, ContentTypeAndTextViewRoleMetadata>[] _creationListeners;
     private readonly Lazy<ITextViewCreationListener, ContentTypeAndTextViewRoleMetadata>[] _textViewCreationListeners;
+    private readonly Lazy<ITextViewConnectionListener, ContentTypeAndTextViewRoleMetadata>[] _connectionListeners;
     private readonly Lazy<IWpfTextViewMarginProvider, MarginProviderMetadata>[] _marginProviders;
     private readonly Lazy<ILineTransformSourceProvider, ContentTypeAndTextViewRoleMetadata>[] _lineTransformSourceProviders;
     private readonly Lazy<ITextViewModelProvider, ContentTypeAndTextViewRoleMetadata>[] _viewModelProviders;
@@ -48,10 +50,12 @@ public sealed class TextEditorFactoryService : ITextEditorFactoryService
         IEditorOperationsFactoryService editorOperationsFactory,
         ITextBufferUndoManagerProvider undoManagerProvider,
         ITextAndAdornmentSequencerFactoryService sequencerFactory,
+        ITextStructureNavigatorSelectorService navigatorSelectorService,
         [ImportMany] Lazy<AdornmentLayerDefinition, Orderable>[] adornmentLayerDefinitions,
         [ImportMany] Lazy<SpaceReservationManagerDefinition, Orderable>[] spaceReservationManagerDefinitions,
         [ImportMany] Lazy<IWpfTextViewCreationListener, ContentTypeAndTextViewRoleMetadata>[] creationListeners,
         [ImportMany] Lazy<ITextViewCreationListener, ContentTypeAndTextViewRoleMetadata>[] textViewCreationListeners,
+        [ImportMany] Lazy<ITextViewConnectionListener, ContentTypeAndTextViewRoleMetadata>[] connectionListeners,
         [ImportMany] Lazy<IWpfTextViewMarginProvider, MarginProviderMetadata>[] marginProviders,
         [ImportMany] Lazy<ILineTransformSourceProvider, ContentTypeAndTextViewRoleMetadata>[] lineTransformSourceProviders,
         [ImportMany] Lazy<ITextViewModelProvider, ContentTypeAndTextViewRoleMetadata>[] viewModelProviders)
@@ -59,6 +63,7 @@ public sealed class TextEditorFactoryService : ITextEditorFactoryService
         _sequencerFactory = sequencerFactory;
         _creationListeners = creationListeners;
         _textViewCreationListeners = textViewCreationListeners;
+        _connectionListeners = connectionListeners;
         _marginProviders = marginProviders;
         _lineTransformSourceProviders = lineTransformSourceProviders;
         _viewModelProviders = viewModelProviders;
@@ -73,6 +78,7 @@ public sealed class TextEditorFactoryService : ITextEditorFactoryService
         _multiSelectionBrokerFactory = multiSelectionBrokerFactory;
         _editorOperationsFactory = editorOperationsFactory;
         _undoManagerProvider = undoManagerProvider;
+        _navigatorSelectorService = navigatorSelectorService;
 
         var ordered = Orderer.Order(adornmentLayerDefinitions.ToList());
         for (int i = 0; i < ordered.Count; i++)
@@ -222,6 +228,32 @@ public sealed class TextEditorFactoryService : ITextEditorFactoryService
             }
         }
 
+        // Connection listeners have the same scoping but are keyed to the *subject buffers*
+        // whose content type matches (Roslyn's TextBufferAssociatedViewService tracks
+        // buffer↔view association through these events). Morgania buffer graphs are fixed for
+        // the view's lifetime, so buffers connect at creation and disconnect at close.
+        foreach (var listener in _connectionListeners)
+        {
+            bool rolesMatch = listener.Metadata.TextViewRoles?.Any() != true || roles.ContainsAny(listener.Metadata.TextViewRoles);
+            if (!rolesMatch)
+            {
+                continue;
+            }
+
+            var subjectBuffers = view.BufferGraph.GetTextBuffers(
+                buffer => listener.Metadata.ContentTypes?.Any(buffer.ContentType.IsOfType) != false);
+            if (subjectBuffers.Count == 0)
+            {
+                continue;
+            }
+
+            // Subscribe the disconnect before notifying the connect: listeners may add their own
+            // Closed handlers during SubjectBuffersConnected that assume disconnection already ran
+            // (event handlers fire in subscription order).
+            view.Closed += (_, _) => listener.Value.SubjectBuffersDisconnected(view, ConnectionReason.TextViewLifetime, subjectBuffers);
+            listener.Value.SubjectBuffersConnected(view, ConnectionReason.TextViewLifetime, subjectBuffers);
+        }
+
         TextViewCreated?.Invoke(this, new TextViewCreatedEventArgs(view));
         return view;
     }
@@ -279,6 +311,9 @@ public sealed class TextEditorFactoryService : ITextEditorFactoryService
 
     internal ITextBufferUndoManager GetUndoManager(ITextBuffer textBuffer)
         => _undoManagerProvider.GetTextBufferUndoManager(textBuffer);
+
+    internal ITextStructureNavigator GetTextStructureNavigator(ITextBuffer textBuffer)
+        => _navigatorSelectorService.GetTextStructureNavigator(textBuffer);
 
     public IWpfTextViewHost CreateTextViewHost(IWpfTextView wpfTextView, bool setFocus)
     {
